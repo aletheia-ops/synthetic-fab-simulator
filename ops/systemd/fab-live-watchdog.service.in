@@ -1,0 +1,6 @@
+[Unit]
+Description=Check the fab_sim live run for a stall or an unhandled failure (ops/fabctl watchdog)
+
+[Service]
+Type=oneshot
+ExecStart=@REPO@/ops/fabctl watchdog

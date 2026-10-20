@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Source workbooks and prepared inputs (see DATA_NOTICE.md and docs/running.md)
+data/
+prepared/
+*.xlsx
+
+# Run outputs, the default topology cache and fabctl worktrees
+outputs/
+/topologies/
+.worktrees/
+
+# Unpacked baseline state (tools/unpack_baseline.py)
+baseline/checkpoint/*/state.json

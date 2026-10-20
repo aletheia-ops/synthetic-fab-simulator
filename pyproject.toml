@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "synthetic-fab-simulator"
+version = "1.0.0"
+description = "Synthetic semiconductor fab simulator that generates factory event data: SMT2020 Dataset 1 on the SMAT2022 layout with physical OHT transport"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+authors = [{name = "aletheia-ops"}]
+keywords = ["semiconductor", "fab", "discrete-event simulation", "AMHS", "OHT", "SMT2020", "SMAT2022", "synthetic data"]
+classifiers = [
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = ["openpyxl>=3.1,<4"]
+[project.urls]
+Homepage = "https://github.com/aletheia-ops/synthetic-fab-simulator"
+Repository = "https://github.com/aletheia-ops/synthetic-fab-simulator"
+Issues = "https://github.com/aletheia-ops/synthetic-fab-simulator/issues"
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+[project.scripts]
+fab-sim = "fab_sim.cli:main"
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

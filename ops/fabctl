@@ -1,0 +1,337 @@
+#!/bin/bash
+# fabctl: operate one long simulation run as systemd user services (fab-live.service, crash
+# recovery and a watchdog). Linux or WSL2 with systemd; see ops/README.md.
+#
+#   fabctl install            write the unit files for this checkout into ~/.config/systemd/user
+#   fabctl status             live service state, commit, attempt, latest checkpoint, stream sizes
+#   fabctl start [--checkpoint-interval S] [--checkpoint-background on|off] [--checkpoint-retain-daily on|off]
+#                [--checkpoint-retain-all on|off] [--drop-exit-targets]
+#                [--from MANIFEST] [--set KEY=JSON ...] [COMMIT]
+#                             resume the current run from its newest checkpoint on COMMIT (default: the
+#                             commit it ran on). --from resumes from an older checkpoint instead (rewind);
+#                             --set changes an execution policy setting (declared policy change, recorded
+#                             in process.json). Checkpoint options and exit targets carry over unless changed.
+#   fabctl launch CONFIG [--name NAME] [--checkpoint-interval S] [--checkpoint-background on|off]
+#                [--checkpoint-retain-daily on|off] [COMMIT]
+#                             start a new run from a run config on COMMIT (default: main), in
+#                             outputs/runs/NAME (default NAME: the config file name). A config with
+#                             checkpoint.resume_from (e.g. baseline/config.json) continues that checkpoint.
+#   fabctl stop [--now]       stop after the next checkpoint (or immediately with --now)
+#   fabctl swap COMMIT [START OPTIONS]
+#                             stop after the next checkpoint, then start on COMMIT
+#   fabctl export MANIFEST DEST [--commit SHA] [--link]
+#                             write a portable bundle (checkpoint, inputs, topology, code, config) to DEST
+#   fabctl verify             check import path, stream growth and manifest continuation of the running run
+#   fabctl recover            (run by fab-live-recover.service when the live run crashes)
+#   fabctl watchdog           (run every 5 min by fab-live-watchdog.timer while a live run is up)
+#
+# Runs always execute from a pinned worktree .worktrees/live-<sha> with PYTHONPATH=<worktree>/src,
+# resume with allow_compatible_build and the previous attempt's execution settings; a policy change
+# happens only through an explicit --set and is checked by verify.
+# Each start or resume is an attempt: outputs/runs/NAME/attempts/<UTC time>-<sha>, listed in order in
+# outputs/runs/NAME/run.json.
+# State: outputs/live-ops/current_live.json (current attempt) and launch.env (read by the unit).
+# FAB_PYTHON selects the interpreter (default: .venv/bin/python of this checkout).
+set -euo pipefail
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+OPS=$REPO/outputs/live-ops
+CUR=$OPS/current_live.json
+mkdir -p "$OPS"
+PY=${FAB_PYTHON:-$REPO/.venv/bin/python}
+UNIT=fab-live.service
+log(){ echo "$(date -u +%FT%TZ) $*"; }
+field(){ [ -f "$CUR" ] || { echo ""; return 0; }; python3 -c "import json,sys;print(json.load(open(sys.argv[2])).get(sys.argv[1]) or '')" "$1" "$CUR"; }
+latest_manifest(){ local ck=$1/simulation/checkpoints; echo "$ck/$(python3 -c "import json;print(json.load(open('$ck/latest.json'))['manifest'])")"; }
+# Newest checkpoint of an attempt, or the checkpoint it resumed from if it wrote none.
+resume_manifest(){
+  if [ -f "$1/simulation/checkpoints/latest.json" ]; then latest_manifest "$1"
+  else python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['resume_from'])" "$1/process.json"; fi
+}
+# Directory for a new attempt of the run that OLD_ATTEMPT belongs to (args: OLD_ATTEMPT WORKTREE SHORT).
+new_attempt_dir(){
+  local run; run=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('run') or '')" "$1/process.json" 2>/dev/null || true)
+  [ -n "$run" ] || { log "attempt $1 belongs to no run folder; start a new run with fabctl launch" >&2; return 1; }
+  echo "$run/attempts/$(date -u +%Y%m%dT%H%M%SZ)-$3"
+}
+# Append an attempt to its run.json.
+record_attempt(){ [ -n "$1" ] || return 0; python3 - "$1/run.json" "$2" <<'PY'
+import json,sys
+p,a=sys.argv[1:3]; r=json.load(open(p)); r['attempts'].append(a); json.dump(r,open(p,'w'),indent=2)
+PY
+}
+live_pid(){ systemctl --user show -p MainPID --value $UNIT; }
+active(){ systemctl --user is-active --quiet $UNIT; }
+
+cmd_install(){
+  local dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user u
+  mkdir -p "$dir"
+  for u in fab-live.service fab-live-recover.service fab-live-watchdog.service fab-live-watchdog.timer; do
+    rm -f "$dir/$u"   # never write through an older symlink into a checkout
+    sed -e "s|@REPO@|$REPO|g" -e "s|@PYTHON@|$PY|g" "$REPO/ops/systemd/$u.in" > "$dir/$u"
+  done
+  systemctl --user daemon-reload; log "units installed for $REPO (not enabled: start them explicitly)"
+}
+
+cmd_status(){
+  local a; a=$(field attempt)
+  echo "service:    $(systemctl --user is-active $UNIT || true) (pid $(live_pid))"
+  [ -n "$(field run)" ] && echo "run:        $(field run)"
+  echo "commit:     $(field commit)"
+  echo "attempt:    $a"
+  [ -f "$a/simulation/checkpoints/latest.json" ] && echo "checkpoint: $(latest_manifest "$a") ($(stat -c %y "$a/simulation/checkpoints/latest.json" | cut -d. -f1))"
+  for s in events oht; do [ -f "$a/simulation/$s.jsonl" ] && echo "$s:  $(du -h "$a/simulation/$s.jsonl" | cut -f1)"; done
+}
+
+wait_checkpoint(){
+  # An attempt that has not written a checkpoint yet has no latest.json: wait for its first.
+  local ck=$1/simulation/checkpoints before; before=$(cat "$ck/latest.json" 2>/dev/null || echo none)
+  log "waiting for the next checkpoint (after $before)"
+  while [ "$(cat "$ck/latest.json" 2>/dev/null || echo none)" = "$before" ]; do
+    active || { log "live run is not running"; return 1; }
+    sleep 2
+  done
+  log "new checkpoint $(cat "$ck/latest.json")"
+}
+
+cmd_stop(){
+  active || { log "live run is not running"; return 0; }
+  [ "${1:-}" = "--now" ] || wait_checkpoint "$(field attempt)"
+  systemctl --user stop fab-live-watchdog.timer
+  systemctl --user stop $UNIT   # SIGTERM; the runner has no SIGINT handler
+  log "stopped"
+}
+
+cmd_start(){
+  active && { log "live run already running (pid $(live_pid))"; return 1; }
+  local interval="" drop_targets="" background="" daily="" sets="" from="" retain_all=""
+  while [ "${1:-}" ]; do case $1 in
+    --checkpoint-interval) interval=$2; shift 2;;
+    --checkpoint-background) case $2 in on|off) background=$2;; *) log "--checkpoint-background takes on or off"; return 2;; esac; shift 2;;
+    --checkpoint-retain-daily) case $2 in on|off) daily=$2;; *) log "--checkpoint-retain-daily takes on or off"; return 2;; esac; shift 2;;
+    --checkpoint-retain-all) case $2 in on|off) retain_all=$2;; *) log "--checkpoint-retain-all takes on or off"; return 2;; esac; shift 2;;
+    --drop-exit-targets) drop_targets=1; shift;;
+    --set) case $2 in *=*) sets="$sets$2"$'\n';; *) log "--set takes KEY=JSON"; return 2;; esac; shift 2;;
+    --from) from=$(readlink -f "$2"); [ -f "$from" ] || { log "--from: no such manifest $2"; return 2; }; shift 2;;
+    *) break;; esac; done
+  local old commit short wt new manifest
+  old=$(field attempt); commit=${1:-$(field commit)}
+  short=$(git -C "$REPO" rev-parse --short=7 "$commit")
+  wt=$REPO/.worktrees/live-$short
+  [ -d "$wt" ] || git -C "$REPO" worktree add -q --detach "$wt" "$short"
+  [ "$(git -C "$wt" rev-parse --short=7 HEAD)" = "$short" ] || { log "worktree $wt is not at $short"; return 1; }
+  [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || { log "worktree $wt has local changes"; return 1; }
+  manifest=${from:-$(resume_manifest "$old")}
+  case "$manifest" in ''|None) log "attempt $old has no checkpoint to resume; start it again with fabctl launch"; return 1;; esac
+  [ -n "$from" ] && log "resuming from the requested checkpoint $manifest"
+  local run; run=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('run') or '')" "$old/process.json" 2>/dev/null || true)
+  new=$(new_attempt_dir "$old" "$wt" "$short") || return 1
+  mkdir -p "$new"
+  python3 - "$old/config.json" "$new" "$interval" "$drop_targets" "$background" "$daily" "$sets" "$old" "$run" "$retain_all" <<'PY'
+import json,sys
+from pathlib import Path
+c=json.load(open(sys.argv[1])); a=Path(sys.argv[2]); old=Path(sys.argv[8])
+declared=[]
+for line in sys.argv[7].splitlines():
+    k,v=line.split('=',1); c['execution'][k]=json.loads(v); declared.append(k)
+# A resume that still starts from a checkpoint written before a declared change
+# (no checkpoint of the previous attempt yet) inherits that declaration.
+proc=json.load(open(old/'process.json')) if (old/'process.json').exists() else {}
+if not declared and not (old/'simulation'/'checkpoints'/'latest.json').exists():declared=proc.get('policy_changes',[])
+if sys.argv[3]: c['checkpoint']['interval_wall_seconds']=int(sys.argv[3])
+if sys.argv[4]: c['execution'].pop('exit_targets',None)
+if sys.argv[5]: c['checkpoint']['background']=sys.argv[5]=='on'
+if sys.argv[6]: c['checkpoint']['retain_daily']=sys.argv[6]=='on'
+# Retain every completed checkpoint (no pruning) instead of the newest 3 (+ daily keepers).
+if len(sys.argv)>10 and sys.argv[10]: c['checkpoint']['retain_completed']=1_000_000 if sys.argv[10]=='on' else 3
+# Reuse the previous attempt's topology cache: regenerating the layout on every
+# resume is slow at full scale.
+c['output'].update(directory=str(a/'simulation'),run_id=Path(sys.argv[9]).name if sys.argv[9] else a.name,
+    topology_directory=c['output'].get('topology_directory') or str(a/'topologies'))
+c['checkpoint'].update(enabled=True,resume_from=None,allow_compatible_build=True,directory=str(a/'simulation'/'checkpoints'))
+c['checkpoint'].pop('allow_policy_change',None)
+if declared:c['checkpoint']['allow_policy_change']=True
+(a/'config.json').write_text(json.dumps(c,indent=2)); (a/'declared_policy_changes.json').write_text(json.dumps(sorted(set(declared))))
+PY
+  printf 'WT=%s\nATTEMPT=%s\nMANIFEST=%s\nPYTHONPATH=%s/src\n' "$wt" "$new" "$manifest" "$wt" > "$OPS/launch.env"
+  python3 - "$CUR" "$new" "$short" "$wt" "$manifest" "$old" "$run" <<'PY'
+import json,sys,datetime
+cur,a,commit,wt,manifest,parent,run=sys.argv[1:8]
+declared=json.load(open(a+'/declared_policy_changes.json'))
+rec={'attempt':a,'commit':commit,'worktree':wt,'resume_from':manifest,'parent_attempt':parent,'policy_changes':declared,
+     'env':{'PYTHONPATH':wt+'/src'},'service':'fab-live.service',
+     'launched_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+if run:rec['run']=run
+json.dump(rec,open(a+'/process.json','w'),indent=2); json.dump(rec,open(cur,'w'),indent=2)
+PY
+  record_attempt "$run" "$new"
+  systemctl --user start $UNIT fab-live-watchdog.timer
+  log "started commit $short in $new from $manifest (checkpoint every $(python3 -c "import json;c=json.load(open('$new/config.json'))['checkpoint'];print(c['interval_wall_seconds'],'s','background' if c.get('background') else 'synchronous')"))"
+  cmd_verify
+}
+
+cmd_verify(){
+  local a pid e1 o1 e2 o2; a=$(field attempt); pid=$(live_pid)
+  active && [ "$pid" != 0 ] || { log "live run is not running"; journalctl --user -u $UNIT -n 20 --no-pager; return 1; }
+  grep -qx "PYTHONPATH=$(field worktree)/src" <(tr '\0' '\n' < /proc/$pid/environ) || { log "PYTHONPATH not set to the worktree"; return 1; }
+  # Restore can take well over 10 minutes when the machine is busy.
+  for _ in $(seq 1 360); do
+    active || { log "live run exited"; journalctl --user -u $UNIT -n 20 --no-pager; return 1; }
+    [ -s "$a/simulation/events.jsonl" ] && [ -s "$a/simulation/oht.jsonl" ] && [ -f "$a/simulation/manifest.json" ] && break
+    sleep 5
+  done
+  [ -s "$a/simulation/events.jsonl" ] || { log "no output after 30 minutes; check with ops/fabctl verify later"; return 1; }
+  e1=$(wc -l < "$a/simulation/events.jsonl"); o1=$(wc -l < "$a/simulation/oht.jsonl"); sleep 30
+  e2=$(wc -l < "$a/simulation/events.jsonl"); o2=$(wc -l < "$a/simulation/oht.jsonl")
+  PYTHONPATH=$(field worktree)/src "$PY" - "$a/simulation/manifest.json" "$a/process.json" <<'PY'
+import json,sys
+from fab_sim.checkpoint import build_identity
+m=json.load(open(sys.argv[1]))
+if 'continuation' not in m:print('fresh run (no continuation)');raise SystemExit
+c=m['continuation']
+declared=set(json.load(open(sys.argv[2])).get('policy_changes',[]))
+changed=set(c.get('policy_changes') or {})
+assert changed<=declared, ('undeclared policy change', changed-declared)
+cross=c.get('cross_build')
+if cross: assert cross['resume_build']==build_identity(), (cross, build_identity())
+print('continuation:', f"cross_build -> {cross['resume_build'][:12]}" if cross else 'same build',
+      '| policy_changes', {k:c['policy_changes'][k] for k in sorted(changed)} if changed else 'none')
+PY
+  log "events $e1 -> $e2, oht $o1 -> $o2"
+  [ "$e2" -gt "$e1" ] && [ "$o2" -gt "$o1" ] || { log "streams not growing"; return 1; }
+  log "verified"
+}
+
+cmd_recover(){
+  # At most 3 automatic recoveries per 6 hours, so a repeating crash stops instead of looping.
+  local journal=$OPS/recoveries.log now recent
+  now=$(date +%s); touch "$journal"
+  recent=$(awk -v t=$((now-21600)) '$1>t' "$journal" | wc -l)
+  { echo "== $(date -u +%FT%TZ) live run failed; last log lines:"; journalctl --user -u $UNIT -n 15 --no-pager; } >> "$OPS/recoveries-detail.log" 2>&1
+  if [ "$recent" -ge 3 ]; then
+    log "recovery limit reached ($recent in 6 h); not restarting" | tee -a "$OPS/recoveries-detail.log"
+    systemctl --user stop fab-live-watchdog.timer; return 1; fi
+  echo "$now" >> "$journal"
+  # Let the crashed process be fully torn down (WSL captures a crash dump of it)
+  # before a fresh process restores the checkpoint: two recoveries started within
+  # seconds of a crash have been seen to hang in the kernel (D state).
+  local delay=${FABCTL_RECOVER_DELAY:-60}
+  log "waiting ${delay} s before resuming" | tee -a "$OPS/recoveries-detail.log"
+  sleep "$delay"
+  systemctl --user reset-failed $UNIT || true
+  cmd_start 2>&1 | tee -a "$OPS/recoveries-detail.log"
+}
+
+cmd_watchdog(){
+  # A crash during a recovery's verify wait leaves the unit failed with no recovery queued, and a hung
+  # process (e.g. stuck in kernel D state after a restore) never exits. Handle both.
+  if systemctl --user is-failed --quiet $UNIT; then
+    systemctl --user is-active --quiet fab-live-recover.service ||
+      { log "live run failed and no recovery is running; starting one" | tee -a "$OPS/recoveries-detail.log"
+        systemctl --user start --no-block fab-live-recover.service; }
+    return 0
+  fi
+  active || return 0
+  local a f age limit; a=$(field attempt); f=$a/progress.jsonl
+  # progress.jsonl gets a record every 60 s once the restore is done; the restore itself may take 30 min.
+  if [ -s "$f" ]; then age=$(( $(date +%s) - $(stat -c %Y "$f") )); limit=1200
+  else age=$(( $(date +%s) - $(stat -c %Y "$a/process.json") )); limit=2700; fi
+  if [ "$age" -lt "$limit" ]; then
+    # Gridlock: the simulation advances but no transfer has been delivered for 3 simulated hours while
+    # transfers wait. A restart would resume into the same jam, so stop the run and keep its state.
+    local stuck; stuck=$(tail -c 2000000 "$f" 2>/dev/null | python3 -c '
+import json,sys
+r=None
+for l in sys.stdin:
+    if l.startswith("{"):
+        try:r=json.loads(l)
+        except Exception:pass
+d=((r or {}).get("last_progress_at_us") or {}).get("transfer_delivered")
+if r and d is not None and r.get("pending_transfer_count",0)>0 and r["now_us"]-d>3*3600e6:
+    print("day %.2f, %.1f simulated hours without a delivery, %d transfers pending"%(r["simulated_days"],(r["now_us"]-d)/3600e6,r["pending_transfer_count"]))')
+    [ -n "$stuck" ] || return 0
+    log "live run gridlocked ($stuck); stopping it without recovery. Inspect $a, then launch or swap." | tee -a "$OPS/recoveries-detail.log"
+    systemctl --user stop $UNIT
+    return 0
+  fi
+  log "live run stalled (no progress for ${age} s); killing it so recovery resumes from the newest checkpoint" | tee -a "$OPS/recoveries-detail.log"
+  systemctl --user kill -s SIGKILL $UNIT
+}
+
+cmd_launch(){
+  active && { log "live run already running (pid $(live_pid))"; return 1; }
+  local source=${1:-}; [ -f "$source" ] || { echo "usage: fabctl launch CONFIG [--name NAME] [options] [COMMIT]"; return 2; }; shift
+  source=$(readlink -f "$source")
+  local interval=1800 background="" daily="" name
+  name=$(basename "$source" .json)
+  while [ "${1:-}" ]; do case $1 in
+    --name) name=$2; shift 2;;
+    --checkpoint-interval) interval=$2; shift 2;;
+    --checkpoint-background) case $2 in on|off) background=$2;; *) log "--checkpoint-background takes on or off"; return 2;; esac; shift 2;;
+    --checkpoint-retain-daily) case $2 in on|off) daily=$2;; *) log "--checkpoint-retain-daily takes on or off"; return 2;; esac; shift 2;;
+    *) break;; esac; done
+  case "$name" in ''|*/*|.*) log "--name must be a plain name"; return 2;; esac
+  local run=$REPO/outputs/runs/$name
+  [ -e "$run" ] && { log "run $run already exists; choose another --name"; return 1; }
+  local commit=${1:-main} short wt new manifest
+  short=$(git -C "$REPO" rev-parse --short=7 "$commit")
+  wt=$REPO/.worktrees/live-$short
+  [ -d "$wt" ] || git -C "$REPO" worktree add -q --detach "$wt" "$short"
+  [ "$(git -C "$wt" rev-parse --short=7 HEAD)" = "$short" ] || { log "worktree $wt is not at $short"; return 1; }
+  [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || { log "worktree $wt has local changes"; return 1; }
+  new=$run/attempts/$(date -u +%Y%m%dT%H%M%SZ)-$short
+  mkdir -p "$new"
+  # Paths in the source config are relative to the config file; the attempt config gets absolute ones.
+  manifest=$(python3 - "$source" "$new" "$interval" "$background" "$daily" "$name" <<'PY'
+import json,sys
+from pathlib import Path
+src=Path(sys.argv[1]); a=Path(sys.argv[2]); c=json.load(open(src))
+def absolute(p):return str((src.parent/p).resolve()) if p is not None else None
+for k in ('manufacturing_path','topology_path','physical_reference_path'):
+    if c['inputs'].get(k) is not None:c['inputs'][k]=absolute(c['inputs'][k])
+c['execution'].pop('max_settlements',None)
+old=c.get('checkpoint',{})
+resume=absolute(old.get('resume_from'))
+c['output'].update(directory=str(a/'simulation'),run_id=sys.argv[6],
+    topology_directory=absolute(c['output']['topology_directory']) if c['output'].get('topology_directory') else str(a.parent.parent/'topologies'))
+c['checkpoint']={'enabled':True,'interval_wall_seconds':int(sys.argv[3]),'directory':str(a/'simulation'/'checkpoints'),
+    'resume_from':None,'allow_compatible_build':True,
+    'background':sys.argv[4]=='on' if sys.argv[4] else bool(old.get('background',False)),
+    'retain_daily':sys.argv[5]=='on' if sys.argv[5] else bool(old.get('retain_daily',False))}
+(a/'config.json').write_text(json.dumps(c,indent=2))
+print(resume or '')
+PY
+)
+  if [ -n "$manifest" ] && [ ! -f "$(dirname "$manifest")/state.json" ]; then
+    if [ -f "$(dirname "$manifest")/state.json.xz" ]; then "$PY" "$REPO/tools/unpack_baseline.py" "$(dirname "$manifest")"
+    else log "no state.json next to $manifest"; return 1; fi
+  fi
+  cp "$source" "$run/config.json"
+  python3 - "$run/run.json" "$name" "$source" <<'PY'
+import json,sys,datetime
+p,name,source=sys.argv[1:4]
+json.dump({'name':name,'source_config':source,'created_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+           'attempts':[]},open(p,'w'),indent=2)
+PY
+  printf 'WT=%s\nATTEMPT=%s\nMANIFEST=%s\nPYTHONPATH=%s/src\n' "$wt" "$new" "$manifest" "$wt" > "$OPS/launch.env"
+  python3 - "$CUR" "$new" "$short" "$wt" "$source" "$manifest" "$run" <<'PY'
+import json,sys,datetime
+cur,a,commit,wt,source,manifest,run=sys.argv[1:8]
+rec={'attempt':a,'commit':commit,'worktree':wt,'resume_from':manifest or None,'parent_attempt':None,'policy_changes':[],
+     'source_config':source,'run':run,'env':{'PYTHONPATH':wt+'/src'},'service':'fab-live.service',
+     'launched_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+json.dump(rec,open(a+'/process.json','w'),indent=2); json.dump(rec,open(cur,'w'),indent=2)
+PY
+  record_attempt "$run" "$new"
+  systemctl --user start $UNIT fab-live-watchdog.timer
+  log "launched run $name on $short in $new${manifest:+ from $manifest}"
+  cmd_verify
+}
+
+cmd_swap(){ [ -n "${1:-}" ] || { echo "usage: fabctl swap COMMIT [START OPTIONS]"; return 2; }
+  local commit=$1; shift; cmd_stop; cmd_start "$@" "$commit"; }
+
+case "${1:-status}" in
+  install) cmd_install;; status) cmd_status;; start) shift; cmd_start "$@";; launch) shift; cmd_launch "$@";; stop) shift; cmd_stop "$@";;
+  swap) shift; cmd_swap "$@";; export) shift; "$PY" "$REPO/ops/export_bundle.py" "$@";; recover) cmd_recover;; watchdog) cmd_watchdog;; verify) cmd_verify;;
+  *) sed -n '2,34p' "$0"; exit 2;;
+esac

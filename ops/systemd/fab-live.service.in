@@ -1,0 +1,11 @@
+[Unit]
+Description=fab_sim live run (prepared by ops/fabctl start or launch)
+# An abnormal exit (crash) resumes from the newest checkpoint; see ops/fabctl recover.
+OnFailure=fab-live-recover.service
+
+[Service]
+Type=simple
+ExecStart=@REPO@/ops/live-exec.sh
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=no

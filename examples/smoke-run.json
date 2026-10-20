@@ -1,0 +1,40 @@
+{
+  "extensions": {
+    "scenario_label": "smoke"
+  },
+  "inputs": {
+    "manufacturing_path": "../layout/manufacturing.json",
+    "physical_reference_path": "../layout/reference.json"
+  },
+  "generation": {
+    "entry_capacity": 12,
+    "exit_capacity": 8,
+    "fleet_count": 7
+  },
+  "workload": {
+    "count": 120,
+    "product_weights": {
+      "Product_3": "0.5",
+      "Product_4": "0.5"
+    },
+    "release_time_scale": "1",
+    "dual_route_validation": true
+  },
+  "execution": {
+    "master_seed": 7,
+    "horizon_us": 259200000000,
+    "max_settlements": 5000
+  },
+  "replay": {
+    "rate": null
+  },
+  "output": {
+    "directory": "../outputs/smoke-run",
+    "run_id": "smoke-run",
+    "live": false
+  },
+  "probes": {
+    "enabled": true,
+    "sample_every": 100
+  }
+}

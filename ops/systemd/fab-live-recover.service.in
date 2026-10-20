@@ -1,0 +1,7 @@
+[Unit]
+Description=Resume the fab_sim live run from its newest checkpoint after a crash
+
+[Service]
+Type=oneshot
+ExecStart=@REPO@/ops/fabctl recover
+TimeoutStartSec=3600
