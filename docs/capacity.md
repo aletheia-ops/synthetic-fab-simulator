@@ -1,5 +1,7 @@
 # Capacity of SMT2020 Dataset 1
 
+**English** | [한국어](capacity.ko.md)
+
 Dataset 1 (HVLM: Products 3 and 4, 105 tool groups, 1,043 tools) releases about 57 LOTs per day at the
 source rate. Whether a configuration can carry that load decides whether WIP levels off or keeps
 growing, so check capacity before reading anything else into a run.

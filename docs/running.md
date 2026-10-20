@@ -1,10 +1,14 @@
 # Running the simulator
 
+**English** | [한국어](running.ko.md)
+
 Commands run from the repository root. Requirements: Linux, WSL2 or macOS (native Windows is not
 supported), CPython 3.12. A full-scale run uses about 3.5 GB of memory while running (4.5 GB at the peak of a restore) and
-needs room for its checkpoint saves on top (see [Checkpoint memory](#checkpoint-memory)): 12 GB of
-RAM or more for background saves; with less (8 GB at minimum), saves fall back to the foreground
-automatically. It writes several GB of disk per
+needs room for its checkpoint saves on top (see [Checkpoint memory](#checkpoint-memory)): 8 GB of
+RAM is enough for background saves; when less memory is free, a save falls back to the foreground
+automatically. On WSL2 the Linux VM gets only half of Windows' memory by default: on an 8 GB PC, set
+`memory=6GB` under `[wsl2]` in `%UserProfile%\.wslconfig` (then `wsl --shutdown`), or a restore of the
+full-scale baseline will not fit. It writes several GB of disk per
 simulated day (see [outputs.md](outputs.md)).
 
 ```bash
@@ -84,7 +88,7 @@ otherwise; `FAB_PREPARED_DIR` (a folder with prepared `manufacturing.json`, `ref
 ## 4. Checkpoints
 
 With `checkpoint.enabled`, a run writes a checkpoint every `interval_wall_seconds` (at full scale the run pauses
-about a minute per foreground save, 5–10 s per background save). Resume with `--resume-from MANIFEST` or
+about 40 s per foreground save, 4–9 s per background save). Resume with `--resume-from MANIFEST` or
 `checkpoint.resume_from`. A checkpoint resumes only with the same inputs, generation, workload, seed
 and policy settings, and the same CPython minor version; the options for crossing builds or changing
 a policy setting are in [settings.md](settings.md#checkpoints). A resumed run continues exactly as the
@@ -97,19 +101,22 @@ Measured on the baseline (about 1,400 LOTs in process; the run itself uses 3.2 G
 
 | `checkpoint.background` | Run pauses per save | Extra memory during a save |
 | --- | --- | --- |
-| `true` (baseline default) | 5–10 s | A forked writer that grows to about 1.15× the run's own memory (3.8 GB at day 60) for about 40 s, plus one more CPU core |
-| `false` | about 1 minute | About 0.5–1 GB |
+| `true` (baseline default) | 4–9 s | A forked writer with about 0.8 GB of private memory for about 45 s, plus one more CPU core |
+| `false` | about 40 s | Under 0.1 GB |
 
-The forked writer starts sharing the run's memory, but Python's reference counting copies almost
-every page it reads, so a background save peaks at about 2.2× the run's memory (about 8.5 GB of used
-system memory for the baseline, measured).
+The forked writer starts by sharing all of the run's memory. Python's reference counting writes to
+every object the writer reads, so the memory pages holding the saved state are copied; the state is
+written node by node, so the writer builds nothing large of its own. On the baseline the used system
+memory peaks about 0.8 GB above the run's own.
 
 With `background: true` the run checks before every save whether a writer fits: available memory
 (`MemAvailable`, capped by any cgroup limit such as systemd `MemoryMax` or a container limit) must be
-at least 1.3× the run's resident memory plus 0.5 GB. If it is not, that save runs in the foreground
-and its entry in `checkpoint_metrics` carries `background_fallback` with the numbers; the next save
-checks again. Where memory cannot be read (no `/proc`, e.g. macOS) the writer is forked. To always
-save in the foreground, set `"background": false` (or `fabctl ... --checkpoint-background off`).
+at least 1.15× the private memory the previous writer ended with, plus 0.25 GB (for the first save:
+half the run's resident memory plus 0.5 GB). If it is not, that save runs in the foreground and its entry
+in `checkpoint_metrics` carries `background_fallback` with the numbers; every background save
+records `writer_private_bytes`. Where memory cannot be read (no `/proc`, e.g. macOS) the writer is
+forked. To always save in the foreground, set `"background": false` (or
+`fabctl ... --checkpoint-background off`).
 
 ## 5. Long runs with fabctl (systemd)
 

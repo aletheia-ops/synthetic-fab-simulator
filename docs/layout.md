@@ -1,5 +1,7 @@
 # Layout and topology
 
+**English** | [한국어](layout.ko.md)
+
 The physical fab is the SMAT2022 LVHM_E layout: a 300 × 153 m rail network with 40 one-way intrabay
 loops, three interbay areas, 2,858 rail nodes, 17,760 one-carrier track buffers and 40 stockers with
 eight spaces each. Rail coordinates, directions, lengths, curves, speed caps and zone control units

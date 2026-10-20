@@ -71,7 +71,7 @@ def test_background_saves_fall_back_to_foreground_without_enough_memory(tmp_path
     import os
     from fab_sim import checkpoint
     baseline=run(fixture(tmp_path))
-    monkeypatch.setattr(checkpoint,'writer_memory_check',lambda:(False,10,5))
+    monkeypatch.setattr(checkpoint,'writer_memory_check',lambda last=None:(False,10,5))
     def no_fork():raise AssertionError('forked despite insufficient memory')
     monkeypatch.setattr(os,'fork',no_fork)
     result=checkpointed(tmp_path,'tight',True)
@@ -82,15 +82,28 @@ def test_background_saves_fall_back_to_foreground_without_enough_memory(tmp_path
     assert {'reason':'insufficient_memory','needed_bytes':10,'available_bytes':5} in [m.get('background_fallback') for m in metrics]
 
 
-def test_writer_memory_check_needs_headroom_over_the_run(monkeypatch):
+def test_writer_memory_check_uses_the_last_writer_or_the_run_size(monkeypatch):
     from fab_sim import checkpoint
     monkeypatch.setattr(checkpoint,'resident_bytes',lambda:1000*2**20)
-    monkeypatch.setattr(checkpoint,'available_memory_bytes',lambda:1700*2**20)
-    assert checkpoint.writer_memory_check()==(False,1300*2**20+checkpoint.WRITER_MEMORY_MARGIN_BYTES,1700*2**20)
-    monkeypatch.setattr(checkpoint,'available_memory_bytes',lambda:4*2**30)
-    assert checkpoint.writer_memory_check()[0] is True
+    monkeypatch.setattr(checkpoint,'available_memory_bytes',lambda:1400*2**20)
+    # No writer has reported yet: half the run plus a margin.
+    assert checkpoint.writer_memory_check()==(True,500*2**20+checkpoint.FIRST_WRITER_MARGIN_BYTES,1400*2**20)
+    monkeypatch.setattr(checkpoint,'available_memory_bytes',lambda:900*2**20)
+    assert checkpoint.writer_memory_check()[0] is False
+    monkeypatch.setattr(checkpoint,'available_memory_bytes',lambda:1400*2**20)
+    # A writer ended with 800 MiB private: 1.15x that plus a margin.
+    fits,needed,available=checkpoint.writer_memory_check(800*2**20)
+    assert fits and needed==int(800*2**20*checkpoint.WRITER_MEMORY_FACTOR)+checkpoint.WRITER_MEMORY_MARGIN_BYTES
     monkeypatch.setattr(checkpoint,'available_memory_bytes',lambda:None)
+    assert checkpoint.writer_memory_check(800*2**20)[0] is True
+    monkeypatch.setattr(checkpoint,'resident_bytes',lambda:None)
     assert checkpoint.writer_memory_check()==(True,None,None)
+
+
+def test_background_writers_report_their_private_memory(tmp_path):
+    result=checkpointed(tmp_path,'report',True)
+    forked=[m for m in result['checkpoint_metrics'] if m.get('background')]
+    assert forked and all(m['writer_private_bytes'] for m in forked)
 
 
 def test_background_write_failure_fails_the_run(tmp_path,monkeypatch):

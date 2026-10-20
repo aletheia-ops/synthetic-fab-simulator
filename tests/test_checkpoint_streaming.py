@@ -1,4 +1,5 @@
 from decimal import Decimal
+import sys
 from fractions import Fraction
 import pytest
 from fab_sim.checkpoint_format import (CheckpointError, decode_state_payload, decode_value, encode_value,
@@ -73,3 +74,33 @@ def test_checkpoint_and_log_pages_are_dropped_from_the_cache_after_fsync(tmp_pat
     assert result['domain_digest'] == baseline['domain_digest']
     assert calls and all(advice == os.POSIX_FADV_DONTNEED for _, advice in calls)
     assert any(size > 0 for size, _ in calls)
+
+
+def test_lazy_capture_streams_the_same_bytes_as_an_eager_capture(tmp_path):
+    from test_runner import fixture
+    from fab_sim.runner import build_runtime, load_config
+    from fab_sim.runtime_state import capture_runtime
+    from fab_sim.checkpoint_format import LazyList, encode_value, write_encoded_value
+    config=load_config(fixture(tmp_path))
+    owners=build_runtime(config,lambda *a:None,initialize=True)
+    for _ in range(40):owners.scheduler.settle(owners.scheduler.next_time_us)
+    eager=capture_runtime(owners);lazy=capture_runtime(owners,lazy=True)
+    assert type(lazy['nodes']) is LazyList and len(lazy['nodes'])==len(eager['nodes'])
+    out=[];write_encoded_value(lazy,out.append)
+    assert b''.join(out)==encode_value(eager)==encode_value(lazy)
+
+
+def test_restore_interns_string_leaves(tmp_path):
+    from test_runner import fixture
+    from fab_sim.runner import build_runtime, load_config
+    from fab_sim.runtime_state import capture_runtime, restore_runtime, runtime_digest
+    from fab_sim.checkpoint_format import encode_value, decode_value
+    config=load_config(fixture(tmp_path))
+    owners=build_runtime(config,lambda *a:None,initialize=True)
+    owners.scheduler.settle(owners.scheduler.next_time_us)
+    state=decode_value(encode_value(capture_runtime(owners)))
+    clone=build_runtime(config,lambda *a:None,initialize=False)
+    restore_runtime(clone,state,clone.actions)
+    assert runtime_digest(clone)==runtime_digest(owners)
+    keys=[k for record in clone.manufacturing.lots.values() for k in record if type(k) is str]
+    assert keys and all(k is sys.intern(k) for k in keys)

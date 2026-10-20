@@ -126,11 +126,26 @@ def validate_resume(bundle, identity: dict[str, object], *, allow_compatible_bui
     return relaxed
 
 
-# A forked writer grows to about 1.2x the run's resident memory (Python reference
-# counting copies almost every page it reads). Fork only when this much is free;
-# otherwise that save runs in the foreground.
-WRITER_MEMORY_FACTOR=1.3
-WRITER_MEMORY_MARGIN_BYTES=512*1024*1024
+# A forked writer shares the run's memory, but Python's reference counting copies
+# every page holding an object it reads. Each writer reports the private memory it
+# ended with; the next save forks only when that much (with a margin) is free,
+# otherwise it saves in the foreground. Before any writer has reported, half the
+# run's resident memory plus a margin is the estimate (measured writers need about
+# a quarter of it); a first writer that forks then calibrates the guard.
+WRITER_MEMORY_FACTOR=1.15
+WRITER_MEMORY_MARGIN_BYTES=256*1024*1024
+FIRST_WRITER_FRACTION=0.5
+FIRST_WRITER_MARGIN_BYTES=512*1024*1024
+
+
+def private_dirty_bytes():
+    """Private (copied or newly written) memory of this process, or None without /proc."""
+    try:
+        with open('/proc/self/smaps_rollup') as stream:
+            for line in stream:
+                if line.startswith('Private_Dirty:'):return int(line.split()[1])*1024
+    except (OSError,ValueError,IndexError):pass
+    return None
 
 
 def resident_bytes():
@@ -164,12 +179,18 @@ def available_memory_bytes():
     return available
 
 
-def writer_memory_check():
-    """(fits, needed_bytes, available_bytes) for a forked checkpoint writer. Unknown
-    memory (no /proc, e.g. macOS) counts as fitting."""
-    rss=resident_bytes();available=available_memory_bytes()
-    if rss is None or available is None:return True,None,available
-    needed=int(rss*WRITER_MEMORY_FACTOR)+WRITER_MEMORY_MARGIN_BYTES
+def writer_memory_check(last_writer_bytes=None):
+    """(fits, needed_bytes, available_bytes) for a forked checkpoint writer, given the
+    private memory the previous writer ended with. Unknown memory (no /proc, e.g.
+    macOS) counts as fitting."""
+    available=available_memory_bytes()
+    if last_writer_bytes:
+        needed=int(last_writer_bytes*WRITER_MEMORY_FACTOR)+WRITER_MEMORY_MARGIN_BYTES
+    else:
+        rss=resident_bytes()
+        if rss is None:return True,None,available
+        needed=int(rss*FIRST_WRITER_FRACTION)+FIRST_WRITER_MARGIN_BYTES
+    if available is None:return True,needed,None
     return available>=needed,needed,available
 
 
@@ -177,7 +198,7 @@ class CheckpointCoordinator:
     def __init__(self, settings, store, *, clock):
         self.settings,self.store,self.clock=settings,store,clock
         self.next_deadline=self._wall()+settings.interval_wall_seconds
-        self.last_boundary=None;self.last_manifest=None;self.metrics=[]
+        self.last_boundary=None;self.last_manifest=None;self.metrics=[];self.last_writer_bytes=None
         # Background mode: (pid, result pipe fd, boundary, saved_tick, settlements, start, stall seconds).
         self.child=None
 
@@ -202,20 +223,22 @@ class CheckpointCoordinator:
         fallback=None
         if (background is not None and self.settings.background and not final
                 and hasattr(os,'fork')):
-            fits,needed,available=writer_memory_check()
+            fits,needed,available=writer_memory_check(self.last_writer_bytes)
             if fits:return self._fork(background,boundary)
             fallback={'reason':'insufficient_memory','needed_bytes':needed,'available_bytes':available}
         start=time.perf_counter();cpu=time.process_time()
         try:
-            # capture() allocates tens of millions of containers; with the
-            # collector on, generation passes rescan them repeatedly (about 4x
-            # slower capture). Collection timing cannot change the captured state.
+            # Capture and the streaming write allocate millions of short-lived
+            # containers; with the collector on, generation passes rescan them
+            # repeatedly (about 4x slower). Nothing here creates reference cycles,
+            # and collection timing cannot change the captured state.
             collecting=gc.isenabled();gc.disable()
-            try:bundle=capture()
+            try:
+                bundle=capture()
+                capture_end=time.perf_counter()
+                path=self.store.write(bundle)
             finally:
                 if collecting:gc.enable()
-            capture_end=time.perf_counter()
-            path=self.store.write(bundle)
         except CheckpointWriteError:raise
         except (OSError,CheckpointError) as error:
             raise CheckpointWriteError('checkpoint capture failed: '+str(error)) from error
@@ -239,18 +262,20 @@ class CheckpointCoordinator:
         read_fd,write_fd=os.pipe()
         pid=os.fork()
         if pid==0:
-            # Child: no garbage collection (it would dirty shared pages), no
-            # inherited cleanup (os._exit skips atexit, buffered files and
-            # finalizers of the parent's open handles).
+            # Child: inherited objects are frozen out of garbage collection (a
+            # collection over them would dirty every shared page), while its own
+            # new objects are still collected. No inherited cleanup (os._exit
+            # skips atexit, buffered files and finalizers of the parent's handles).
             status=1
             try:
-                gc.disable();os.close(read_fd)
+                gc.freeze();gc.enable();os.close(read_fd)
                 bundle=build(prepared)
                 child_start=time.perf_counter()
                 path=self.store.write(bundle)
                 result={'ok':True,'path':str(path),'saved_tick':bundle.manifest.saved_tick,
                     'settlements':bundle.manifest.settlements,'write_wall_seconds':time.perf_counter()-child_start,
-                    'payload_bytes':(path.parent/'state.json').stat().st_size}
+                    'payload_bytes':(path.parent/'state.json').stat().st_size,
+                    'writer_private_bytes':private_dirty_bytes()}
                 status=0
             except BaseException as error:
                 result={'ok':False,'error':type(error).__name__+': '+str(error)}
@@ -286,6 +311,8 @@ class CheckpointCoordinator:
             'manifest_path':str(path),'background':True,'parent_stall_wall_seconds':stall,
             'save_wall_seconds':time.perf_counter()-start,'write_wall_seconds':result['write_wall_seconds'],
             'payload_bytes':result['payload_bytes'],'peak_rss_bytes_so_far':_peak_rss(resource.RUSAGE_SELF),
-            'writer_peak_rss_bytes_so_far':_peak_rss(resource.RUSAGE_CHILDREN)})
+            'writer_peak_rss_bytes_so_far':_peak_rss(resource.RUSAGE_CHILDREN),
+            'writer_private_bytes':result.get('writer_private_bytes')})
+        if result.get('writer_private_bytes'):self.last_writer_bytes=result['writer_private_bytes']
         del self.metrics[:-32]
         return True

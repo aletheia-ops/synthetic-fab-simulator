@@ -1,5 +1,7 @@
 # Data notice
 
+**English** | [한국어](DATA_NOTICE.ko.md)
+
 The simulator code in this repository is MIT licensed (see `LICENSE`). The files listed
 below are **not** covered by that license. They are derived from two public research
 testbeds and are redistributed here only so that the simulator can be run and its results

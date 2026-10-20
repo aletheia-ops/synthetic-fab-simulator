@@ -1,5 +1,7 @@
 # Layout inputs
 
+**English** | [한국어](README.ko.md)
+
 Prepared inputs for SMT2020 Dataset 1 on the SMAT2022 LVHM_E layout. They are derived from the
 source workbooks; see [DATA_NOTICE.md](../DATA_NOTICE.md) for sources, citations and terms.
 

@@ -1,5 +1,7 @@
 # Run settings
 
+**English** | [한국어](settings.ko.md)
+
 A run is configured by one JSON file (see `examples/` and `baseline/config.json`). Unknown keys are
 rejected, so a misspelt setting fails instead of being ignored. Relative paths resolve against the
 config file's directory.
@@ -85,7 +87,7 @@ run manifest. The production column is the value in `baseline/config.json`.
 | `resume_from` | none | A checkpoint `manifest.json` to continue from |
 | `allow_compatible_build` | false | Accept a checkpoint written by another build with the same state contract and Python/RNG runtime (recorded as `cross_build`) |
 | `allow_policy_change` | false | Accept a checkpoint whose identity differs only in the policy settings above (recorded as `policy_changes`) |
-| `background` | false (baseline: true) | Write checkpoints from a forked process: the run pauses 5–10 s instead of about a minute, but the writer needs about 1.15× the run's memory while it writes. Before each save the run checks free memory (including container and systemd limits) and saves in the foreground instead when less than 1.3× its own memory + 0.5 GB is available; such saves are marked `background_fallback` in the checkpoint metrics (see [running.md](running.md#checkpoint-memory)) |
+| `background` | false (baseline: true) | Write checkpoints from a forked process: the run pauses 4–9 s instead of about 40 s, but the writer needs memory while it writes (about 0.8 GB on the baseline). Before each save the run checks free memory (including container and systemd limits) against what the previous writer used and saves in the foreground instead when it would not fit; such saves are marked `background_fallback` in the checkpoint metrics (see [running.md](running.md#checkpoint-memory)) |
 | `verify_history` | false | On resume, also verify the retired-history archive chain (needs the `history/` directories of the run the checkpoint came from) |
 
 A checkpoint resumes only with the same inputs, generation, workload, seed and policy settings (except

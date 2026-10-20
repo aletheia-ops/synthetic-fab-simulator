@@ -73,3 +73,36 @@ def test_active_flow_indexes_and_work_counts_are_excluded_from_projection():
     assert domain_digest(state_projection(state))==before
     c.slots['entry:0']['reservation']='physical'
     assert domain_digest(state_projection(state))!=before
+
+
+def test_projection_digest_equals_the_projected_digest_throughout_a_run(tmp_path):
+    from test_ongoing_runner import observation_fixture
+    from fab_sim.runner import build_runtime, load_config
+    from fab_sim.probes import domain_digest, projection_digest, state_projection
+    from fab_sim.runtime_state import runtime_digest
+    config=load_config(observation_fixture(tmp_path,workload={},execution={'horizon_us':1000000000}))
+    owners=build_runtime(config,lambda *a:None,initialize=True)
+    roots=('scheduler','streams','custody','manufacturing','transfers','traffic','flow','maintenance','amhs_faults')
+    seen=set()
+    for step in range(300):
+        if owners.scheduler.next_time_us is None:break
+        owners.scheduler.settle(owners.scheduler.next_time_us)
+        if step%15==0:
+            state={name:getattr(owners,name) for name in roots}
+            digest=projection_digest(state)
+            assert digest==domain_digest(state_projection(state))
+            assert digest==runtime_digest(owners)
+            seen.add(digest)
+    assert len(seen)>3
+
+
+def test_projection_digest_matches_on_mixed_values():
+    from collections import deque, OrderedDict
+    from decimal import Decimal
+    from fractions import Fraction
+    from random import Random
+    from fab_sim.probes import domain_digest, projection_digest, state_projection
+    value={'a':[1,'x',None,True,2.5,Decimal('1.25'),Fraction(1,3),'é"\\',deque([3,4])],
+        'b':{(1,'k'):'t',(0,'z'):[1],5:{'q':frozenset({('a',1),('b',2)})}},'c':{3,1,2},
+        'd':OrderedDict([('z',1),('a',lambda:0)]),'r':Random(7),'t':(1,(2,3))}
+    assert projection_digest(value)==domain_digest(state_projection(value))

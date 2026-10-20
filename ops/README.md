@@ -1,5 +1,7 @@
 # ops: long runs with fabctl
 
+**English** | [한국어](README.ko.md)
+
 A full-scale run produces factory data for days or weeks of wall time. `fabctl` runs it as a
 systemd user service, so it survives closing the terminal, saves checkpoints, resumes by itself
 after a crash and can be stopped, resumed, rewound or moved to new code without losing state.
@@ -73,7 +75,7 @@ Options of `launch` and `start`:
 | `--checkpoint-interval S` | Wall-clock seconds between checkpoints (default 1800) |
 | `--checkpoint-retain-daily on\|off` | Keep one checkpoint per simulated day for two weeks, then one per week, besides the newest three |
 | `--checkpoint-retain-all on\|off` | Keep every checkpoint (`start` only) |
-| `--checkpoint-background on\|off` | Save from a forked process: the run pauses 5–10 s instead of about a minute, but the writer needs about as much memory as the run while it writes; a save falls back to the foreground when that memory is not free ([memory](../docs/running.md#checkpoint-memory)) |
+| `--checkpoint-background on\|off` | Save from a forked process: the run pauses 4–9 s instead of about 40 s, but the writer needs memory while it writes (about 0.8 GB on the baseline); a save falls back to the foreground when that memory is not free ([memory](../docs/running.md#checkpoint-memory)) |
 | `--from MANIFEST` | Resume from this older checkpoint instead of the newest (rewind; `start` only) |
 | `--set KEY=JSON` | Change an execution policy setting from this resume on, e.g. `--set down_tool_output=true` (recorded as a declared policy change; `start` only) |
 | `--drop-exit-targets` | Remove `execution.exit_targets`, so a run that reached them keeps going (`start` only) |

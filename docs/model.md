@@ -1,5 +1,7 @@
 # Simulation model
 
+**English** | [한국어](model.ko.md)
+
 What the simulator models and how: the fab it builds from the SMT2020 manufacturing model and the
 SMAT2022 physical layout, how LOTs are released, processed and transported, how vehicles move, and
 how time, randomness and outcomes work. Settings that switch behaviours are listed in

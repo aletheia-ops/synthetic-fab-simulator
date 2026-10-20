@@ -1,5 +1,7 @@
 # Outputs
 
+**English** | [한국어](outputs.ko.md)
+
 The simulator is an upstream event generator: it stands in for the sensors and
 controllers of a physical fab. Each simulation output directory (`output.directory`;
 for runs started with `fabctl launch`, `outputs/runs/NAME/attempts/<attempt>/simulation/`) contains:

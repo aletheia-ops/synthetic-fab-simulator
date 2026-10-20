@@ -1,5 +1,7 @@
 """Declared native owner state, shared data references and allocation-only restore."""
 from collections import deque, defaultdict, OrderedDict
+from decimal import Decimal
+import sys
 from dataclasses import dataclass
 from fractions import Fraction
 from .actions import ActionRef, BoundAction, export_action, restore_action
@@ -67,58 +69,98 @@ def _roots(owners):
 
 
 def runtime_digest(owners):
-    from .probes import domain_digest, state_projection
-    return domain_digest(state_projection({name:getattr(owners,name) for name in
-        ('scheduler','streams','custody','manufacturing','transfers','traffic','flow','maintenance','amhs_faults')}))
+    from .probes import projection_digest
+    return projection_digest({name:getattr(owners,name) for name in
+        ('scheduler','streams','custody','manufacturing','transfers','traffic','flow','maintenance','amhs_faults')})
 
 
-def capture_runtime(owners: RuntimeOwners) -> dict[str, object]:
+_LEAF_TYPES = (type(None), bool, int, float, str, bytes)
+
+
+class _Capture:
+    """Canonical node graph of the native owners, built in two passes.
+
+    assign() walks the state in the same depth-first order as the original
+    single-pass encoder and numbers every container on first sight; node()
+    then produces one node at a time (children as references or tagged
+    leaves). Producing nodes lazily while writing means the whole tagged graph
+    never exists in memory; the nodes and their order are the same as an eager
+    capture, so the checkpoint bytes are identical."""
+
+    def __init__(self):
+        self.references = {}; self.objects = []; self.native_objects = []
+        self.action_refs = []; self.set_members = {}
+
+    def assign(self, value):
+        if isinstance(value, BoundAction):
+            self.action_refs.append(value.ref); return
+        if isinstance(value, Fraction): return
+        t = type(value)
+        if t in _LEAF_TYPES or t is Decimal: return
+        if id(value) in self.references: return
+        self.references[id(value)] = len(self.objects); self.objects.append(value)
+        if t in (dict, OrderedDict, defaultdict):
+            if t is defaultdict and value.default_factory is not int: raise CheckpointError('unsupported default factory')
+            for k, v in value.items():
+                self.assign(k); self.assign(v)
+        elif t in (list, tuple, set, frozenset, deque):
+            values = list(value)
+            if t in (set, frozenset):
+                from .checkpoint_format import encode_value
+                values.sort(key=encode_value); self.set_members[id(value)] = values
+            for v in values: self.assign(v)
+        elif t.__name__ in OBJECT_FIELDS and t is OBJECT_FIELDS[t.__name__][0]:
+            self.native_objects.append(value)
+            fields = OBJECT_FIELDS[t.__name__][1].split()
+            allowed = set(fields) | {'scheduler', 'claims', 'dirty', 'emit', 'actions'}
+            if isinstance(value, SerializedHandler): allowed.update(('_pending', '_pending_order', '_pending_signature', '_history_lookup', '_pending_changed'))
+            if isinstance(value, Cascade): allowed.add('_history_lookup')
+            if set(vars(value)) - allowed: raise CheckpointError('unsupported native object fields')
+            for k in fields: self.assign(getattr(value, k))
+        else: raise CheckpointError('unsupported native owner: ' + t.__name__)
+
+    def tag(self, value):
+        """A reference to an assigned container, or the tagged leaf."""
+        if isinstance(value, BoundAction): return ['action', export_action(value)]
+        if isinstance(value, Fraction): return ['fraction', (value.numerator, value.denominator)]
+        t = type(value)
+        if t in _LEAF_TYPES or t is Decimal: return ['value', value]
+        return ['ref', self.references[id(value)]]
+
+    def node(self, value):
+        t = type(value)
+        if t in (dict, OrderedDict, defaultdict):
+            return [t.__name__, [[self.tag(k), self.tag(v)] for k, v in value.items()]]
+        if t in (list, tuple, set, frozenset, deque):
+            values = self.set_members[id(value)] if t in (set, frozenset) else value
+            node = [t.__name__, [self.tag(v) for v in values]]
+            if t is deque: node.append(value.maxlen)
+            return node
+        return [t.__name__, {k: self.tag(getattr(value, k)) for k in OBJECT_FIELDS[t.__name__][1].split()}]
+
+    def nodes(self):
+        for value in self.objects: yield self.node(value)
+
+
+def capture_runtime(owners: RuntimeOwners, *, lazy: bool = False) -> dict[str, object]:
+    """The canonical runtime state. With lazy=True the node list is a LazyList
+    that write_encoded_value streams node by node (same bytes, far less memory)."""
+    from .checkpoint_format import LazyList
     scheduler = owners.scheduler.export_state()
     if owners.custody._notification_depth or owners.custody._changed:
         raise CheckpointError('custody transition is in progress')
-    nodes=[]; references={}; native_objects=[]; action_refs=[]
-    def encode(value):
-        if isinstance(value, BoundAction):
-            action_refs.append(value.ref)
-            return ['action',export_action(value)]
-        if isinstance(value,Fraction):return ['fraction',(value.numerator,value.denominator)]
-        t=type(value)
-        if t in (type(None),bool,int,float,str,bytes):return ['value',value]
-        from decimal import Decimal
-        if t is Decimal:return ['value',value]
-        if id(value) in references:return ['ref',references[id(value)]]
-        identity=len(nodes);references[id(value)]=identity;nodes.append(None)
-        if t in (dict,OrderedDict,defaultdict):
-            if t is defaultdict and value.default_factory is not int:raise CheckpointError('unsupported default factory')
-            node=[t.__name__,[[encode(k),encode(v)] for k,v in value.items()]]
-        elif t in (list,tuple,set,frozenset,deque):
-            values=list(value)
-            if t in (set,frozenset):
-                from .checkpoint_format import encode_value
-                values.sort(key=encode_value)
-            node=[t.__name__,[encode(v) for v in values]]
-            if t is deque:node.append(value.maxlen)
-        elif t.__name__ in OBJECT_FIELDS and t is OBJECT_FIELDS[t.__name__][0]:
-            native_objects.append(value)
-            fields=OBJECT_FIELDS[t.__name__][1].split()
-            allowed=set(fields)|{'scheduler','claims','dirty','emit','actions'}
-            if isinstance(value,SerializedHandler):allowed.update(('_pending','_pending_order','_pending_signature','_history_lookup','_pending_changed'))
-            if isinstance(value,Cascade):allowed.add('_history_lookup')
-            if set(vars(value))-allowed:raise CheckpointError('unsupported native object fields')
-            node=[t.__name__,{k:encode(getattr(value,k)) for k in fields}]
-        else:raise CheckpointError('unsupported native owner: '+t.__name__)
-        nodes[identity]=node
-        return ['ref',identity]
-    root_states={}
-    for name,owner in _roots(owners).items():
-        fields,ignored=SCHEMAS[name];fields=fields.split()
-        if set(vars(owner))-set(fields)-set(ignored.split()):
+    capture = _Capture(); roots = _roots(owners)
+    for name, owner in roots.items():
+        fields, ignored = SCHEMAS[name]; fields = fields.split()
+        if set(vars(owner)) - set(fields) - set(ignored.split()):
             raise CheckpointError('unsupported '+name+' state fields: '+str(set(vars(owner))-set(fields)-set(ignored.split())))
-        root_states[name]={k:encode(getattr(owner,k)) for k in fields}
+        for k in fields: capture.assign(getattr(owner, k))
+    root_states = {name: {k: capture.tag(getattr(owner, k)) for k in SCHEMAS[name][0].split()} for name, owner in roots.items()}
     from .native_actions import validate_native_action
-    for ref in action_refs:validate_native_action(owners,ref)
-    _validate_scheduler_callbacks(owners,native_objects)
-    _check_ownership(owners,native_objects)
+    for ref in capture.action_refs: validate_native_action(owners, ref)
+    _validate_scheduler_callbacks(owners, capture.native_objects)
+    _check_ownership(owners, capture.native_objects)
+    nodes = LazyList(len(capture.objects), capture.nodes) if lazy else list(capture.nodes())
     return {'version':1,'owners':root_states,'nodes':nodes,'scheduler':scheduler,
         'streams':owners.streams.export_state(),'physical_digest':runtime_digest(owners)}
 
@@ -133,7 +175,9 @@ def restore_runtime(owners: RuntimeOwners, state: dict[str, object], actions, *,
         def decode(value):
             if type(value) is not list or len(value)!=2:raise ValueError('invalid state reference')
             tag,data=value
-            if tag=='value':return data
+            # Restored strings are interned, as a running process shares its field
+            # names: one object per distinct value instead of one per record.
+            if tag=='value':return sys.intern(data) if type(data) is str else data
             if tag=='fraction':return Fraction(*data)
             if tag=='action':
                 action=restore_action(data,actions);action_refs.append(action.ref)

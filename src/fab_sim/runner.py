@@ -19,7 +19,7 @@ from .workload import ReleaseSource
 from .flow import Flow
 from .output import Output,OutputFailure
 from .publisher import Pacer,Publisher
-from .probes import Probes,domain_digest,state_projection
+from .probes import Probes,domain_digest,state_projection,projection_digest
 from .outcomes import classify_stop
 from .streams import StreamProjection,POLICY as STREAMS_POLICY
 
@@ -490,7 +490,7 @@ def run(config_path:Path,*,publication_adapter=None,clock=time.monotonic,sleep=t
 
     def capture_checkpoint():
         retire_history()
-        runtime=capture_runtime(owners)
+        runtime=capture_runtime(owners,lazy=True)
         evidence=output.checkpoint_watermark()
         state={'runtime':runtime,'progress':observer.export_state(),
             'control':{'settlements':settlements,'exit_targets':targets,
@@ -506,7 +506,7 @@ def run(config_path:Path,*,publication_adapter=None,clock=time.monotonic,sleep=t
         retire_history()
         return output.checkpoint_watermark()
     def build_checkpoint(evidence):
-        runtime=capture_runtime(owners)
+        runtime=capture_runtime(owners,lazy=True)
         state={'runtime':runtime,'progress':observer.export_state(),
             'control':{'settlements':settlements,'exit_targets':targets,
                 'exit_targets_reached_at_us':exit_targets_reached_at_us},
@@ -582,8 +582,8 @@ def run(config_path:Path,*,publication_adapter=None,clock=time.monotonic,sleep=t
         summary['progress']=observer.snapshot(s.now_us)
         observer.maybe_report(s.now_us,settlements,force=True)
         summary['domain_digest_version']='full-physical-state-archive-v9'
-        summary['domain_digest']=domain_digest(state_projection({'scheduler':s,'streams':streams,'custody':custody,
-            'manufacturing':m,'transfers':t,'traffic':traffic,'flow':flow,'maintenance':maintenance,'amhs_faults':amhs_faults}))
+        summary['domain_digest']=projection_digest({'scheduler':s,'streams':streams,'custody':custody,
+            'manufacturing':m,'transfers':t,'traffic':traffic,'flow':flow,'maintenance':maintenance,'amhs_faults':amhs_faults})
         if targets:output.summary=deepcopy(summary)
         return output.finalize(summary)
     except OutputFailure:

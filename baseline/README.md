@@ -1,5 +1,7 @@
 # Baseline fab state
 
+**English** | [한국어](README.ko.md)
+
 A ready-to-continue state of the full-scale fab at **simulated day 60.40** (75,142,454 settlements),
 and the configuration that continues it. Start here to get factory data without waiting for an empty
 fab to fill up.
@@ -37,9 +39,8 @@ mkdir -p outputs/baseline
 Restoring the state takes about 2 minutes on an otherwise idle machine (longer when the CPU is
 busy) and 4.5 GB of memory at its peak; the run then uses about
 3.2–3.6 GB. Checkpoints are saved every 30 minutes by a forked background writer (the run pauses
-5–10 s), which needs about as much memory again for about 40 s (12 GB of RAM or more). When not enough
-memory is free, a save runs in the foreground instead (pauses about a minute, needs about 1 GB
-extra); see [docs/running.md](../docs/running.md#checkpoint-memory). The continued run's `manifest.json` records
+4–9 s), which needs about 0.8 GB more for about 45 s. When not enough memory is free, a save
+runs in the foreground instead (pauses about 40 s, needs under 0.1 GB extra); see [docs/running.md](../docs/running.md#checkpoint-memory). The continued run's `manifest.json` records
 where it came from under `continuation` (`cross_build` names the build that wrote the checkpoint when
 yours differs) and `topology_artifact.cache_hit: true`.
 

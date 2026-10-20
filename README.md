@@ -1,5 +1,7 @@
 # Synthetic Fab Simulator
 
+**English** | [한국어](README.ko.md)
+
 A simulator of a synthetic semiconductor fab that generates realistic factory data. It runs the
 complete SMT2020 Dataset 1 manufacturing model (two products with 583- and 343-step routes, 105 tool
 groups, setups, batching, cascading, rework, sampling, breakdowns and PMs) on the SMAT2022 fab layout,
@@ -17,8 +19,9 @@ so you can start generating data from a busy fab right away, without preparing a
 
 Requirements: Linux, WSL2 or macOS; CPython 3.12 (newer versions are untested, and a checkpoint,
 including the baseline, resumes only on the Python minor version that wrote it); for a
-full-scale run 8 GB of RAM at minimum, 12 GB or more for fast background checkpoints (with less,
-checkpoints are saved in the foreground automatically).
+full-scale run 8 GB of RAM (checkpoints are saved by a background writer; when not enough memory is
+free, a save runs in the foreground automatically; on WSL2 with 8 GB, give the VM 6 GB, see
+[docs/running.md](docs/running.md)).
 
 ```bash
 git clone https://github.com/aletheia-ops/synthetic-fab-simulator.git
